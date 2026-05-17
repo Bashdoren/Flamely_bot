@@ -3,8 +3,8 @@ import firebase_admin
 from firebase_admin import credentials, firestore
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler,
-    CallbackQueryHandler, ConversationHandler, filters, ContextTypes
+    Updater, CommandHandler, MessageHandler, Filters,
+    CallbackQueryHandler, ConversationHandler, CallbackContext
 )
 
 # ========== НАСТРОЙКИ ==========
@@ -19,7 +19,6 @@ cred = credentials.Certificate(SERVICE_ACCOUNT_FILE)
 firebase_admin.initialize_app(cred)
 db = firestore.client()
 
-# Состояния ConversationHandler
 (
     WAIT_UID_PRIME, WAIT_UID_ELO, WAIT_ELO_VALUE,
     WAIT_UID_VERIFY, WAIT_VERIFY_TYPE,
@@ -28,28 +27,14 @@ db = firestore.client()
 ) = range(10)
 
 
-# ========== УТИЛИТЫ ==========
-
-def is_admin(user_id):
-    return user_id == ADMIN_ID
-
-def admin_required(func):
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not is_admin(update.effective_user.id):
-            await update.message.reply_text("❌ Нет доступа.")
-            return ConversationHandler.END
-        return await func(update, context)
-    return wrapper
+def is_admin(uid): return uid == ADMIN_ID
 
 
-# ========== /start ==========
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def start(update: Update, context: CallbackContext):
     uid = update.effective_user.id
     if ADMIN_ID == 0:
-        await update.message.reply_text(f"Твой Telegram ID: {uid}\nВставь его в ADMIN_ID в коде.")
+        update.message.reply_text(f"Твой Telegram ID: {uid}\nВставь его в ADMIN_ID в коде.")
         return
-
     if is_admin(uid):
         kb = [
             [InlineKeyboardButton("💎 Prime", callback_data="admin_prime"),
@@ -57,325 +42,228 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("✅ Верификация", callback_data="admin_verify"),
              InlineKeyboardButton("💬 Тикеты", callback_data="admin_tickets")],
         ]
-        await update.message.reply_text(
-            "👑 Админ-панель:", reply_markup=InlineKeyboardMarkup(kb)
-        )
+        update.message.reply_text("👑 Админ-панель:", reply_markup=InlineKeyboardMarkup(kb))
     else:
         kb = [
             [InlineKeyboardButton("💎 Купить Prime", callback_data="buy_prime")],
             [InlineKeyboardButton("✅ Верификация", callback_data="start_verify")],
             [InlineKeyboardButton("💬 Поддержка", callback_data="support")],
         ]
-        await update.message.reply_text(
-            "👋 Добро пожаловать в Flamely!\nЧто хочешь сделать?",
-            reply_markup=InlineKeyboardMarkup(kb)
-        )
+        update.message.reply_text("👋 Добро пожаловать в Flamely!", reply_markup=InlineKeyboardMarkup(kb))
 
 
-# ========== АДМИН: PRIME ==========
+# ===== PRIME =====
+def admin_prime_cb(update: Update, context: CallbackContext):
+    q = update.callback_query; q.answer()
+    if not is_admin(q.from_user.id): return
+    kb = [[InlineKeyboardButton("✅ Выдать", callback_data="prime_give"),
+           InlineKeyboardButton("❌ Снять", callback_data="prime_remove")]]
+    q.edit_message_text("💎 Prime:", reply_markup=InlineKeyboardMarkup(kb))
 
-async def admin_prime_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if not is_admin(query.from_user.id):
-        return
-    kb = [
-        [InlineKeyboardButton("✅ Выдать", callback_data="prime_give"),
-         InlineKeyboardButton("❌ Снять", callback_data="prime_remove")]
-    ]
-    await query.edit_message_text("💎 Prime — выберите действие:", reply_markup=InlineKeyboardMarkup(kb))
-
-async def prime_give_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
+def prime_give_cb(update: Update, context: CallbackContext):
+    q = update.callback_query; q.answer()
     context.user_data["prime_action"] = "give"
-    await query.edit_message_text("Введите UID игрока для выдачи Prime:")
+    q.edit_message_text("Введите UID игрока для выдачи Prime:")
     return WAIT_UID_PRIME
 
-async def prime_remove_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
+def prime_remove_cb(update: Update, context: CallbackContext):
+    q = update.callback_query; q.answer()
     context.user_data["prime_action"] = "remove"
-    await query.edit_message_text("Введите UID игрока для снятия Prime:")
+    q.edit_message_text("Введите UID игрока для снятия Prime:")
     return WAIT_UID_PRIME
 
-async def prime_uid_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return ConversationHandler.END
+def prime_uid_received(update: Update, context: CallbackContext):
+    if not is_admin(update.effective_user.id): return ConversationHandler.END
     uid = update.message.text.strip()
-    action = context.user_data.get("prime_action")
-    value = action == "give"
+    value = context.user_data.get("prime_action") == "give"
     db.collection("users").document(uid).set({"prime": value}, merge=True)
-    status = "выдан ✅" if value else "снят ❌"
-    await update.message.reply_text(f"💎 Prime {status} игроку {uid}")
+    update.message.reply_text(f"💎 Prime {'выдан ✅' if value else 'снят ❌'} игроку {uid}")
     return ConversationHandler.END
 
 
-# ========== АДМИН: ELO ==========
-
-async def admin_elo_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if not is_admin(query.from_user.id):
-        return
-    await query.edit_message_text("📊 Введите UID игрока для изменения ELO:")
+# ===== ELO =====
+def admin_elo_cb(update: Update, context: CallbackContext):
+    q = update.callback_query; q.answer()
+    if not is_admin(q.from_user.id): return
+    q.edit_message_text("📊 Введите UID игрока:")
     return WAIT_UID_ELO
 
-async def elo_uid_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return ConversationHandler.END
+def elo_uid_received(update: Update, context: CallbackContext):
+    if not is_admin(update.effective_user.id): return ConversationHandler.END
     context.user_data["elo_uid"] = update.message.text.strip()
-    await update.message.reply_text("Введите новое значение ELO:")
+    update.message.reply_text("Введите новое значение ELO:")
     return WAIT_ELO_VALUE
 
-async def elo_value_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return ConversationHandler.END
-    try:
-        elo = int(update.message.text.strip())
+def elo_value_received(update: Update, context: CallbackContext):
+    if not is_admin(update.effective_user.id): return ConversationHandler.END
+    try: elo = int(update.message.text.strip())
     except ValueError:
-        await update.message.reply_text("❌ ELO должно быть числом.")
+        update.message.reply_text("❌ ELO должно быть числом.")
         return WAIT_ELO_VALUE
     uid = context.user_data["elo_uid"]
     db.collection("users").document(uid).set({"elo": elo}, merge=True)
-    await update.message.reply_text(f"📊 ELO установлено {elo} для {uid}")
+    update.message.reply_text(f"📊 ELO = {elo} для {uid}")
     return ConversationHandler.END
 
 
-# ========== АДМИН: ВЕРИФИКАЦИЯ ==========
-
-async def admin_verify_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if not is_admin(query.from_user.id):
-        return
-    await query.edit_message_text("✅ Введите UID игрока для верификации:")
+# ===== ВЕРИФИКАЦИЯ (АДМИН) =====
+def admin_verify_cb(update: Update, context: CallbackContext):
+    q = update.callback_query; q.answer()
+    if not is_admin(q.from_user.id): return
+    q.edit_message_text("✅ Введите UID игрока:")
     return WAIT_UID_VERIFY
 
-async def verify_uid_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return ConversationHandler.END
+def verify_uid_received(update: Update, context: CallbackContext):
+    if not is_admin(update.effective_user.id): return ConversationHandler.END
     context.user_data["verify_uid"] = update.message.text.strip()
-    kb = [
-        [InlineKeyboardButton("🔵 Синяя", callback_data="verify_blue"),
-         InlineKeyboardButton("🟡 Золотая", callback_data="verify_gold")],
-        [InlineKeyboardButton("❌ Снять", callback_data="verify_remove")]
-    ]
-    await update.message.reply_text("Выберите тип верификации:", reply_markup=InlineKeyboardMarkup(kb))
+    kb = [[InlineKeyboardButton("🔵 Синяя", callback_data="verify_blue"),
+           InlineKeyboardButton("🟡 Золотая", callback_data="verify_gold")],
+          [InlineKeyboardButton("❌ Снять", callback_data="verify_remove")]]
+    update.message.reply_text("Тип верификации:", reply_markup=InlineKeyboardMarkup(kb))
     return WAIT_VERIFY_TYPE
 
-async def verify_type_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
+def verify_type_cb(update: Update, context: CallbackContext):
+    q = update.callback_query; q.answer()
     uid = context.user_data.get("verify_uid")
-    action = query.data
-
-    if action == "verify_blue":
-        db.collection("users").document(uid).set({"verification": "blue"}, merge=True)
-        await query.edit_message_text(f"🔵 Синяя верификация выдана {uid}")
-    elif action == "verify_gold":
-        db.collection("users").document(uid).set({"verification": "gold"}, merge=True)
-        await query.edit_message_text(f"🟡 Золотая верификация выдана {uid}")
-    elif action == "verify_remove":
-        db.collection("users").document(uid).set({"verification": None}, merge=True)
-        await query.edit_message_text(f"❌ Верификация снята с {uid}")
+    vmap = {"verify_blue": "blue", "verify_gold": "gold", "verify_remove": None}
+    db.collection("users").document(uid).set({"verification": vmap[q.data]}, merge=True)
+    labels = {"verify_blue": "🔵 Синяя выдана", "verify_gold": "🟡 Золотая выдана", "verify_remove": "❌ Снята"}
+    q.edit_message_text(f"{labels[q.data]} для {uid}")
     return ConversationHandler.END
 
 
-# ========== АДМИН: ТИКЕТЫ ==========
-
-async def admin_tickets_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if not is_admin(query.from_user.id):
+# ===== ТИКЕТЫ =====
+def admin_tickets_cb(update: Update, context: CallbackContext):
+    q = update.callback_query; q.answer()
+    if not is_admin(q.from_user.id): return
+    tickets = list(db.collection("support_tickets").where("status", "==", "open").stream())
+    if not tickets:
+        q.edit_message_text("💬 Открытых тикетов нет.")
         return
-    tickets = db.collection("support_tickets").where("status", "==", "open").stream()
-    ticket_list = list(tickets)
-    if not ticket_list:
-        await query.edit_message_text("💬 Открытых тикетов нет.")
-        return
-
     text = "💬 Открытые тикеты:\n\n"
     kb = []
-    for t in ticket_list:
-        data = t.to_dict()
-        text += f"#{t.id[:6]} от {data.get('username','?')}: {data.get('message','')[:50]}\n"
+    for t in tickets:
+        d = t.to_dict()
+        text += f"#{t.id[:6]} от {d.get('username','?')}: {d.get('message','')[:50]}\n"
         kb.append([InlineKeyboardButton(f"Ответить #{t.id[:6]}", callback_data=f"reply_{t.id}")])
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb))
+    q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb))
 
-async def reply_ticket_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    ticket_id = query.data.replace("reply_", "")
-    context.user_data["reply_ticket_id"] = ticket_id
-    await query.edit_message_text(f"Введите ответ на тикет #{ticket_id[:6]}:")
+def reply_ticket_cb(update: Update, context: CallbackContext):
+    q = update.callback_query; q.answer()
+    context.user_data["reply_ticket_id"] = q.data.replace("reply_", "")
+    q.edit_message_text("Введите ответ:")
     return WAIT_SUPPORT_REPLY
 
-async def support_reply_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return ConversationHandler.END
-    ticket_id = context.user_data["reply_ticket_id"]
-    reply_text = update.message.text
-
-    ticket = db.collection("support_tickets").document(ticket_id).get()
-    if ticket.exists:
-        user_tg_id = ticket.to_dict().get("telegram_id")
-        db.collection("support_tickets").document(ticket_id).update({"status": "closed"})
-        if user_tg_id:
-            await context.bot.send_message(
-                chat_id=user_tg_id,
-                text=f"💬 Ответ поддержки:\n{reply_text}"
-            )
-    await update.message.reply_text("✅ Ответ отправлен, тикет закрыт.")
+def support_reply_received(update: Update, context: CallbackContext):
+    if not is_admin(update.effective_user.id): return ConversationHandler.END
+    tid = context.user_data["reply_ticket_id"]
+    t = db.collection("support_tickets").document(tid).get()
+    if t.exists:
+        uid = t.to_dict().get("telegram_id")
+        db.collection("support_tickets").document(tid).update({"status": "closed"})
+        if uid:
+            context.bot.send_message(chat_id=uid, text=f"💬 Ответ поддержки:\n{update.message.text}")
+    update.message.reply_text("✅ Ответ отправлен.")
     return ConversationHandler.END
 
 
-# ========== ИГРОК: ПОДДЕРЖКА ==========
-
-async def support_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text("💬 Опишите вашу проблему:")
+# ===== ПОДДЕРЖКА (ИГРОК) =====
+def support_cb(update: Update, context: CallbackContext):
+    q = update.callback_query; q.answer()
+    q.edit_message_text("💬 Опишите проблему:")
     return WAIT_SUPPORT_MSG
 
-async def support_msg_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def support_msg_received(update: Update, context: CallbackContext):
     user = update.effective_user
-    msg = update.message.text
-    ticket_ref = db.collection("support_tickets").add({
+    db.collection("support_tickets").add({
         "telegram_id": user.id,
         "username": user.username or user.first_name,
-        "message": msg,
+        "message": update.message.text,
         "status": "open"
     })
-    await update.message.reply_text("✅ Тикет создан! Ожидайте ответа от администратора.")
+    update.message.reply_text("✅ Тикет создан! Ожидайте ответа.")
     if ADMIN_ID:
-        await context.bot.send_message(
-            chat_id=ADMIN_ID,
-            text=f"📩 Новый тикет от @{user.username or user.first_name}:\n{msg}"
-        )
+        context.bot.send_message(chat_id=ADMIN_ID,
+            text=f"📩 Новый тикет от @{user.username or user.first_name}:\n{update.message.text}")
     return ConversationHandler.END
 
 
-# ========== ИГРОК: ВЕРИФИКАЦИЯ ==========
-
-async def start_verify_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text(
-        "✅ Верификация\n\nШаг 1: Введите ваш игровой ID (UID в игре):"
-    )
+# ===== ВЕРИФИКАЦИЯ (ИГРОК) =====
+def start_verify_cb(update: Update, context: CallbackContext):
+    q = update.callback_query; q.answer()
+    q.edit_message_text("✅ Шаг 1: Введите ваш игровой ID:")
     return WAIT_VERIFY_GAME_ID
 
-async def verify_game_id_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def verify_game_id_received(update: Update, context: CallbackContext):
     context.user_data["verify_game_id"] = update.message.text.strip()
-    await update.message.reply_text(
-        "Шаг 2: Отправьте ссылки на ваши соц. сети через запятую:\n"
-        "Telegram, TikTok, YouTube, Like"
-    )
+    update.message.reply_text("Шаг 2: Отправьте ссылки на соц. сети (Telegram, TikTok, YouTube, Like):")
     return WAIT_VERIFY_SOCIALS
 
-async def verify_socials_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def verify_socials_received(update: Update, context: CallbackContext):
     context.user_data["verify_socials"] = update.message.text.strip()
-    await update.message.reply_text(
-        "Шаг 3: Отправьте фото/скриншот, подтверждающий что эти соц. сети ваши:"
-    )
+    update.message.reply_text("Шаг 3: Отправьте фото, подтверждающее что соц. сети ваши:")
     return WAIT_VERIFY_PHOTO
 
-async def verify_photo_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def verify_photo_received(update: Update, context: CallbackContext):
     user = update.effective_user
     game_id = context.user_data.get("verify_game_id")
     socials = context.user_data.get("verify_socials")
-
-    # Сохраняем заявку в Firebase
     db.collection("verification_requests").add({
         "telegram_id": user.id,
         "username": user.username or user.first_name,
-        "game_id": game_id,
-        "socials": socials,
-        "status": "pending"
+        "game_id": game_id, "socials": socials, "status": "pending"
     })
-
-    await update.message.reply_text(
-        "📨 Заявка на верификацию отправлена! Ожидайте ответа."
-    )
-
-    # Уведомляем админа
+    update.message.reply_text("📨 Заявка отправлена! Ожидайте ответа.")
     if ADMIN_ID:
-        photo = update.message.photo[-1].file_id if update.message.photo else None
-        caption = (
-            f"🔔 Новая заявка на верификацию!\n"
-            f"👤 @{user.username or user.first_name} (ID: {user.id})\n"
-            f"🎮 Игровой ID: {game_id}\n"
-            f"🔗 Соц. сети: {socials}\n\n"
-            f"Одобрить: /verify_approve {user.id}\n"
-            f"Отклонить: /verify_reject {user.id}"
-        )
-        if photo:
-            await context.bot.send_photo(chat_id=ADMIN_ID, photo=photo, caption=caption)
+        caption = (f"🔔 Новая заявка на верификацию!\n"
+                   f"👤 @{user.username or user.first_name} (ID: {user.id})\n"
+                   f"🎮 Игровой ID: {game_id}\n🔗 Соц. сети: {socials}\n\n"
+                   f"Одобрить: /verify_approve {user.id}\nОтклонить: /verify_reject {user.id}")
+        if update.message.photo:
+            context.bot.send_photo(chat_id=ADMIN_ID, photo=update.message.photo[-1].file_id, caption=caption)
         else:
-            await context.bot.send_message(chat_id=ADMIN_ID, text=caption)
-
+            context.bot.send_message(chat_id=ADMIN_ID, text=caption)
     return ConversationHandler.END
 
 
-# ========== КОМАНДЫ ОДОБРЕНИЯ/ОТКЛОНЕНИЯ ВЕРИФИКАЦИИ ==========
+# ===== ОДОБРЕНИЕ/ОТКЛОНЕНИЕ =====
+def verify_approve(update: Update, context: CallbackContext):
+    if not is_admin(update.effective_user.id): return
+    try: target_id = int(context.args[0])
+    except: update.message.reply_text("Использование: /verify_approve <id>"); return
+    kb = [[InlineKeyboardButton("🔵 Синяя", callback_data=f"vapprove_blue_{target_id}"),
+           InlineKeyboardButton("🟡 Золотая", callback_data=f"vapprove_gold_{target_id}")]]
+    update.message.reply_text("Какую верификацию выдать?", reply_markup=InlineKeyboardMarkup(kb))
 
-async def verify_approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    try:
-        target_id = int(context.args[0])
-    except (IndexError, ValueError):
-        await update.message.reply_text("Использование: /verify_approve <telegram_id>")
-        return
-    kb = [
-        [InlineKeyboardButton("🔵 Синяя", callback_data=f"vapprove_blue_{target_id}"),
-         InlineKeyboardButton("🟡 Золотая", callback_data=f"vapprove_gold_{target_id}")]
-    ]
-    await update.message.reply_text("Какую верификацию выдать?", reply_markup=InlineKeyboardMarkup(kb))
+def verify_approve_type_cb(update: Update, context: CallbackContext):
+    q = update.callback_query; q.answer()
+    parts = q.data.split("_")
+    vtype, target_id = parts[1], int(parts[2])
+    db.collection("users").document(str(target_id)).set({"verification": vtype}, merge=True)
+    context.bot.send_message(chat_id=target_id,
+        text=f"✅ Вы прошли верификацию! {'🔵 Синяя' if vtype == 'blue' else '🟡 Золотая'}")
+    q.edit_message_text(f"✅ Верификация выдана {target_id}")
 
-async def verify_approve_type_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    parts = query.data.split("_")
-    vtype = parts[1]
-    target_id = int(parts[2])
+def verify_reject(update: Update, context: CallbackContext):
+    if not is_admin(update.effective_user.id): return
+    try: target_id = int(context.args[0])
+    except: update.message.reply_text("Использование: /verify_reject <id>"); return
+    context.bot.send_message(chat_id=target_id,
+        text="❌ Вы не прошли верификацию. Не расстраивайтесь — наберите актив и напишите снова.")
+    update.message.reply_text(f"❌ Отклонено для {target_id}")
 
-    db.collection("users").document(str(target_id)).set(
-        {"verification": vtype}, merge=True
-    )
-    await context.bot.send_message(
-        chat_id=target_id,
-        text=f"✅ Вы прошли верификацию! Тип: {'🔵 Синяя' if vtype == 'blue' else '🟡 Золотая'}"
-    )
-    await query.edit_message_text(f"✅ Верификация ({vtype}) выдана {target_id}")
+def buy_prime_cb(update: Update, context: CallbackContext):
+    q = update.callback_query; q.answer()
+    q.edit_message_text("💎 Для покупки Prime напишите администратору.")
 
-async def verify_reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    try:
-        target_id = int(context.args[0])
-    except (IndexError, ValueError):
-        await update.message.reply_text("Использование: /verify_reject <telegram_id>")
-        return
-    await context.bot.send_message(
-        chat_id=target_id,
-        text="❌ Вы не прошли верификацию. Не расстраивайтесь — вы можете набрать актив и написать снова."
-    )
-    await update.message.reply_text(f"❌ Верификация отклонена для {target_id}")
-
-
-# ========== CANCEL ==========
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Отменено.")
+def cancel(update: Update, context: CallbackContext):
+    update.message.reply_text("Отменено.")
     return ConversationHandler.END
 
-
-# ========== MAIN ==========
 
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    updater = Updater(BOT_TOKEN)
+    dp = updater.dispatcher
 
     conv = ConversationHandler(
         entry_points=[
@@ -388,31 +276,32 @@ def main():
             CallbackQueryHandler(start_verify_cb, pattern="^start_verify$"),
         ],
         states={
-            WAIT_UID_PRIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, prime_uid_received)],
-            WAIT_UID_ELO: [MessageHandler(filters.TEXT & ~filters.COMMAND, elo_uid_received)],
-            WAIT_ELO_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, elo_value_received)],
-            WAIT_UID_VERIFY: [MessageHandler(filters.TEXT & ~filters.COMMAND, verify_uid_received)],
+            WAIT_UID_PRIME: [MessageHandler(Filters.text & ~Filters.command, prime_uid_received)],
+            WAIT_UID_ELO: [MessageHandler(Filters.text & ~Filters.command, elo_uid_received)],
+            WAIT_ELO_VALUE: [MessageHandler(Filters.text & ~Filters.command, elo_value_received)],
+            WAIT_UID_VERIFY: [MessageHandler(Filters.text & ~Filters.command, verify_uid_received)],
             WAIT_VERIFY_TYPE: [CallbackQueryHandler(verify_type_cb, pattern="^verify_")],
-            WAIT_SUPPORT_MSG: [MessageHandler(filters.TEXT & ~filters.COMMAND, support_msg_received)],
-            WAIT_SUPPORT_REPLY: [MessageHandler(filters.TEXT & ~filters.COMMAND, support_reply_received)],
-            WAIT_VERIFY_GAME_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, verify_game_id_received)],
-            WAIT_VERIFY_SOCIALS: [MessageHandler(filters.TEXT & ~filters.COMMAND, verify_socials_received)],
-            WAIT_VERIFY_PHOTO: [MessageHandler(filters.PHOTO | filters.TEXT, verify_photo_received)],
+            WAIT_SUPPORT_MSG: [MessageHandler(Filters.text & ~Filters.command, support_msg_received)],
+            WAIT_SUPPORT_REPLY: [MessageHandler(Filters.text & ~Filters.command, support_reply_received)],
+            WAIT_VERIFY_GAME_ID: [MessageHandler(Filters.text & ~Filters.command, verify_game_id_received)],
+            WAIT_VERIFY_SOCIALS: [MessageHandler(Filters.text & ~Filters.command, verify_socials_received)],
+            WAIT_VERIFY_PHOTO: [MessageHandler(Filters.photo | Filters.text, verify_photo_received)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
-        per_message=False
     )
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("verify_approve", verify_approve))
-    app.add_handler(CommandHandler("verify_reject", verify_reject))
-    app.add_handler(CallbackQueryHandler(admin_prime_cb, pattern="^admin_prime$"))
-    app.add_handler(CallbackQueryHandler(admin_tickets_cb, pattern="^admin_tickets$"))
-    app.add_handler(CallbackQueryHandler(verify_approve_type_cb, pattern="^vapprove_"))
-    app.add_handler(conv)
+    dp.add_handler(CommandHandler("start", start))
+    dp.add_handler(CommandHandler("verify_approve", verify_approve))
+    dp.add_handler(CommandHandler("verify_reject", verify_reject))
+    dp.add_handler(CallbackQueryHandler(admin_prime_cb, pattern="^admin_prime$"))
+    dp.add_handler(CallbackQueryHandler(admin_tickets_cb, pattern="^admin_tickets$"))
+    dp.add_handler(CallbackQueryHandler(verify_approve_type_cb, pattern="^vapprove_"))
+    dp.add_handler(CallbackQueryHandler(buy_prime_cb, pattern="^buy_prime$"))
+    dp.add_handler(conv)
 
     print("Бот запущен!")
-    app.run_polling()
+    updater.start_polling()
+    updater.idle()
 
 if __name__ == "__main__":
     main()
