@@ -8,7 +8,7 @@ from telegram.ext import (
 )
 
 BOT_TOKEN = "8610496403:AAHLyRtghzD9A4QGsHNoS1CxNYa0q7FMYVE"
-ADMIN_ID = 0
+ADMIN_ID = 8842178466
 SERVICE_ACCOUNT_FILE = "serviceAccount.json"
 
 logging.basicConfig(level=logging.INFO)
