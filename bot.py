@@ -1,589 +1,281 @@
-import asyncio
-import json
-import os
 import logging
-from datetime import datetime
-from aiogram import Bot, Dispatcher, F
-from aiogram.types import (
-    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
-    LabeledPrice, PreCheckoutQuery, ContentType
+import firebase_admin
+from firebase_admin import credentials, firestore
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Updater, CommandHandler, MessageHandler, Filters,
+    CallbackQueryHandler, ConversationHandler, CallbackContext
 )
-from aiogram.filters import CommandStart, Command
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
 
-# ══════════════════════════════════════════════
-#  КОНФИГ — заполни перед запуском
-# ══════════════════════════════════════════════
-BOT_TOKEN   = "ВАШ_BOT_TOKEN"          # от @BotFather
-ADMIN_IDS   = [123456789]               # твой Telegram ID
-PRIME_PRICE = 50                        # цена в звёздах
+BOT_TOKEN = "8610496403:AAHLyRtghzD9A4QGsHNoS1CxNYa0q7FMYVE"
+ADMIN_ID = 7152934487  # <- ВСТАВЬ СВОЙ ID
+SERVICE_ACCOUNT_FILE = "serviceAccount.json"
 
 logging.basicConfig(level=logging.INFO)
-bot = Bot(token=BOT_TOKEN)
-dp  = Dispatcher(storage=MemoryStorage())
+cred = credentials.Certificate(SERVICE_ACCOUNT_FILE)
+firebase_admin.initialize_app(cred)
+db = firestore.client()
 
-# ══════════════════════════════════════════════
-#  БАЗА ДАННЫХ (JSON)
-# ══════════════════════════════════════════════
-DB_FILE = "data.json"
+(WAIT_UID_PRIME, WAIT_UID_ELO, WAIT_ELO_VALUE,
+ WAIT_UID_VERIFY, WAIT_VERIFY_TYPE, WAIT_SUPPORT_MSG,
+ WAIT_SUPPORT_REPLY, WAIT_VERIFY_GAME_ID,
+ WAIT_VERIFY_SOCIALS, WAIT_VERIFY_PHOTO) = range(10)
 
-def load_db() -> dict:
-    if not os.path.exists(DB_FILE):
-        return {"users": {}, "verif_requests": {}, "prime_requests": {}}
-    with open(DB_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
+def is_admin(uid): return uid == ADMIN_ID
 
-def save_db(data: dict):
-    with open(DB_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-def get_user(uid: int) -> dict:
-    db = load_db()
-    return db["users"].get(str(uid), {})
-
-def set_user(uid: int, data: dict):
-    db = load_db()
-    db["users"][str(uid)] = data
-    save_db(db)
-
-# ══════════════════════════════════════════════
-#  FSM СОСТОЯНИЯ
-# ══════════════════════════════════════════════
-class PrimeFlow(StatesGroup):
-    enter_nickname  = State()
-    confirm         = State()
-
-class VerifFlow(StatesGroup):
-    enter_nickname  = State()
-    confirm_nick    = State()
-    send_result     = State()
-    confirm_result  = State()
-    send_socials    = State()
-    send_screenshot = State()
-
-# ══════════════════════════════════════════════
-#  ХЕЛПЕРЫ — клавиатуры
-# ══════════════════════════════════════════════
-def kb_main():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💎 Купить Prime",        callback_data="menu_prime")],
-        [InlineKeyboardButton(text="✅ Верификация аккаунта", callback_data="menu_verif")],
-        [InlineKeyboardButton(text="💬 Техподдержка",         callback_data="menu_support")],
-    ])
-
-def kb_yes_no(yes_cb: str, no_cb: str):
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ Да",  callback_data=yes_cb),
-        InlineKeyboardButton(text="❌ Нет", callback_data=no_cb),
-    ]])
-
-def kb_back():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="◀️ Главное меню", callback_data="back_main")]
-    ])
-
-def kb_admin_prime(uid: int, nickname: str):
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="✅ Выдать Prime", callback_data=f"adm_prime_yes_{uid}"),
-            InlineKeyboardButton(text="❌ Отклонить",    callback_data=f"adm_prime_no_{uid}"),
-        ]
-    ])
-
-def kb_admin_verif(uid: int):
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="✅ Верифицировать", callback_data=f"adm_verif_yes_{uid}"),
-            InlineKeyboardButton(text="❌ Отклонить",      callback_data=f"adm_verif_no_{uid}"),
-        ]
-    ])
-
-# ══════════════════════════════════════════════
-#  /start
-# ══════════════════════════════════════════════
-@dp.message(CommandStart())
-async def cmd_start(msg: Message, state: FSMContext):
-    await state.clear()
-    await msg.answer(
-        "👋 Привет! Я <b>Элла</b> — помощник Flamely.\n\n"
-        "Выбери что тебя интересует:",
-        reply_markup=kb_main(),
-        parse_mode="HTML"
-    )
-
-# ══════════════════════════════════════════════
-#  НАЗАД В МЕНЮ
-# ══════════════════════════════════════════════
-@dp.callback_query(F.data == "back_main")
-async def back_main(cb: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await cb.message.edit_text(
-        "👋 Привет! Я <b>Элла</b> — помощник Flamely.\n\n"
-        "Выбери что тебя интересует:",
-        reply_markup=kb_main(),
-        parse_mode="HTML"
-    )
-
-# ══════════════════════════════════════════════
-#  ТЕХПОДДЕРЖКА
-# ══════════════════════════════════════════════
-@dp.callback_query(F.data == "menu_support")
-async def menu_support(cb: CallbackQuery):
-    await cb.message.edit_text(
-        "💬 <b>Техподдержка</b>\n\n"
-        "Напиши свой вопрос прямо в чате на сайте Flamely:\n"
-        "🔗 Раздел <b>ПОДДЕРЖКА</b> → кнопка темы → опиши проблему.\n\n"
-        "Администратор ответит в течение 24 часов.",
-        reply_markup=kb_back(),
-        parse_mode="HTML"
-    )
-
-# ══════════════════════════════════════════════════════════════
-#  ██████  PRIME FLOW
-# ══════════════════════════════════════════════════════════════
-
-@dp.callback_query(F.data == "menu_prime")
-async def prime_start(cb: CallbackQuery, state: FSMContext):
-    await state.set_state(PrimeFlow.enter_nickname)
-    await cb.message.edit_text(
-        "💎 <b>Покупка Prime</b>\n\n"
-        "Введи свой <b>никнейм на сайте Flamely</b> точно как он написан:",
-        parse_mode="HTML"
-    )
-
-@dp.message(PrimeFlow.enter_nickname)
-async def prime_nickname(msg: Message, state: FSMContext):
-    nick = msg.text.strip()
-    await state.update_data(nickname=nick)
-    await state.set_state(PrimeFlow.confirm)
-    await msg.answer(
-        f"Твой ник на сайте: <b>{nick}</b>\n\nВсё верно?",
-        reply_markup=kb_yes_no("prime_confirm_yes", "prime_confirm_no"),
-        parse_mode="HTML"
-    )
-
-@dp.callback_query(F.data == "prime_confirm_no")
-async def prime_confirm_no(cb: CallbackQuery, state: FSMContext):
-    await state.set_state(PrimeFlow.enter_nickname)
-    await cb.message.edit_text(
-        "Введи никнейм заново:",
-    )
-
-@dp.callback_query(F.data == "prime_confirm_yes")
-async def prime_confirm_yes(cb: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    nick = data["nickname"]
-    uid  = cb.from_user.id
-
-    # Сохраняем pending-заявку
-    db = load_db()
-    db["prime_requests"][str(uid)] = {
-        "nickname": nick,
-        "tg_user": cb.from_user.username or str(uid),
-        "status": "pending_payment",
-        "date": datetime.now().isoformat()
-    }
-    save_db(db)
-
-    # Отправляем инвойс со звёздами
-    await cb.message.delete()
-    await bot.send_invoice(
-        chat_id=uid,
-        title="💎 Flamely Prime",
-        description=f"Prime-статус для игрока {nick} на сайте Flamely",
-        payload=f"prime_{uid}_{nick}",
-        currency="XTR",               # Telegram Stars
-        prices=[LabeledPrice(label="Prime", amount=PRIME_PRICE)],
-    )
-    await state.clear()
-
-# ── Подтверждение платежа ──
-@dp.pre_checkout_query()
-async def pre_checkout(query: PreCheckoutQuery):
-    await query.answer(ok=True)
-
-@dp.message(F.content_type == ContentType.SUCCESSFUL_PAYMENT)
-async def payment_success(msg: Message):
-    uid      = msg.from_user.id
-    db       = load_db()
-    req      = db["prime_requests"].get(str(uid), {})
-    nick     = req.get("nickname", "?")
-    tg_user  = msg.from_user.username or str(uid)
-
-    db["prime_requests"][str(uid)]["status"] = "paid"
-    save_db(db)
-
-    # Уведомляем пользователя
-    await msg.answer(
-        "✅ <b>Оплата прошла!</b>\n\n"
-        f"💎 Prime для <b>{nick}</b> будет выдан в течение нескольких минут.\n"
-        "Ожидай уведомления.",
-        parse_mode="HTML",
-        reply_markup=kb_back()
-    )
-
-    # Уведомляем всех админов
-    for admin_id in ADMIN_IDS:
-        try:
-            await bot.send_message(
-                admin_id,
-                f"💎 <b>НОВАЯ ОПЛАТА PRIME</b>\n\n"
-                f"👤 Ник на сайте: <code>{nick}</code>\n"
-                f"📱 Telegram: @{tg_user} (<code>{uid}</code>)\n"
-                f"💰 Оплачено: {PRIME_PRICE} ⭐\n"
-                f"🕐 {datetime.now().strftime('%d.%m.%Y %H:%M')}",
-                reply_markup=kb_admin_prime(uid, nick),
-                parse_mode="HTML"
-            )
-        except Exception:
-            pass
-
-# ── Админ выдаёт Prime ──
-@dp.callback_query(F.data.startswith("adm_prime_yes_"))
-async def adm_prime_yes(cb: CallbackQuery):
-    if cb.from_user.id not in ADMIN_IDS:
-        return await cb.answer("❌ Нет доступа")
-
-    uid = int(cb.data.split("_")[-1])
-    db  = load_db()
-    req = db["prime_requests"].get(str(uid), {})
-    nick = req.get("nickname", "?")
-
-    db["prime_requests"][str(uid)]["status"] = "issued"
-    save_db(db)
-
-    await bot.send_message(
-        uid,
-        "🎉 <b>Prime выдан!</b>\n\n"
-        f"Зайди на сайт — у тебя уже активен <b>💎 Prime</b> для ника <code>{nick}</code>.\n\n"
-        "Приятной игры!",
-        parse_mode="HTML",
-        reply_markup=kb_back()
-    )
-    await cb.message.edit_text(
-        cb.message.text + "\n\n✅ <b>Prime выдан</b>",
-        parse_mode="HTML"
-    )
-
-@dp.callback_query(F.data.startswith("adm_prime_no_"))
-async def adm_prime_no(cb: CallbackQuery):
-    if cb.from_user.id not in ADMIN_IDS:
-        return await cb.answer("❌ Нет доступа")
-
-    uid = int(cb.data.split("_")[-1])
-    db  = load_db()
-    db["prime_requests"][str(uid)]["status"] = "rejected"
-    save_db(db)
-
-    await bot.send_message(
-        uid,
-        "❌ <b>Заявка на Prime отклонена.</b>\n\n"
-        "Если считаешь это ошибкой — напиши в поддержку на сайте.",
-        parse_mode="HTML",
-        reply_markup=kb_back()
-    )
-    await cb.message.edit_text(
-        cb.message.text + "\n\n❌ <b>Отклонено</b>",
-        parse_mode="HTML"
-    )
-
-# ══════════════════════════════════════════════════════════════
-#  ████  ВЕРИФИКАЦИЯ FLOW
-# ══════════════════════════════════════════════════════════════
-
-@dp.callback_query(F.data == "menu_verif")
-async def verif_start(cb: CallbackQuery, state: FSMContext):
-    await state.set_state(VerifFlow.enter_nickname)
-    await cb.message.edit_text(
-        "✅ <b>Верификация аккаунта</b>\n\n"
-        "Введи свой <b>никнейм на сайте Flamely</b> точно как он написан:",
-        parse_mode="HTML"
-    )
-
-@dp.message(VerifFlow.enter_nickname)
-async def verif_nickname(msg: Message, state: FSMContext):
-    nick = msg.text.strip()
-    await state.update_data(nickname=nick)
-    await state.set_state(VerifFlow.confirm_nick)
-    await msg.answer(
-        f"Твой ник на сайте: <b>{nick}</b>\n\nВсё верно?",
-        reply_markup=kb_yes_no("verif_nick_yes", "verif_nick_no"),
-        parse_mode="HTML"
-    )
-
-@dp.callback_query(F.data == "verif_nick_no")
-async def verif_nick_no(cb: CallbackQuery, state: FSMContext):
-    await state.set_state(VerifFlow.enter_nickname)
-    await cb.message.edit_text("Введи никнейм заново:")
-
-@dp.callback_query(F.data == "verif_nick_yes")
-async def verif_nick_yes(cb: CallbackQuery, state: FSMContext):
-    await state.set_state(VerifFlow.send_result)
-    await cb.message.edit_text(
-        "📊 <b>Шаг 1 из 3 — Результат матча</b>\n\n"
-        "Отправь <b>скриншот результата своего матча</b> на Flamely.\n"
-        "(фото или файл)",
-        parse_mode="HTML"
-    )
-
-@dp.message(VerifFlow.send_result, F.photo | F.document)
-async def verif_result_received(msg: Message, state: FSMContext):
-    # Сохраняем file_id
-    if msg.photo:
-        file_id = msg.photo[-1].file_id
+def start(update, context):
+    uid = update.effective_user.id
+    if ADMIN_ID == 0:
+        update.message.reply_text(f"Твой Telegram ID: {uid}")
+        return
+    if is_admin(uid):
+        kb = [[InlineKeyboardButton("💎 Prime", callback_data="admin_prime"),
+               InlineKeyboardButton("📊 ELO", callback_data="admin_elo")],
+              [InlineKeyboardButton("✅ Верификация", callback_data="admin_verify"),
+               InlineKeyboardButton("💬 Тикеты", callback_data="admin_tickets")]]
+        update.message.reply_text("👑 Админ-панель:", reply_markup=InlineKeyboardMarkup(kb))
     else:
-        file_id = msg.document.file_id
-    await state.update_data(result_file=file_id, result_type="photo" if msg.photo else "document")
-    await state.set_state(VerifFlow.confirm_result)
-    await msg.answer(
-        "Это скриншот результата твоего матча?",
-        reply_markup=kb_yes_no("verif_result_yes", "verif_result_no")
-    )
+        kb = [[InlineKeyboardButton("💎 Купить Prime", callback_data="buy_prime")],
+              [InlineKeyboardButton("✅ Верификация", callback_data="start_verify")],
+              [InlineKeyboardButton("💬 Поддержка", callback_data="support")]]
+        update.message.reply_text("👋 Добро пожаловать в Flamely!", reply_markup=InlineKeyboardMarkup(kb))
 
-@dp.message(VerifFlow.send_result)
-async def verif_result_wrong(msg: Message):
-    await msg.answer("📸 Отправь <b>фото или файл</b> скриншота.", parse_mode="HTML")
+def admin_prime_cb(update, context):
+    q = update.callback_query; q.answer()
+    if not is_admin(q.from_user.id): return
+    kb = [[InlineKeyboardButton("✅ Выдать", callback_data="prime_give"),
+           InlineKeyboardButton("❌ Снять", callback_data="prime_remove")]]
+    q.edit_message_text("💎 Prime:", reply_markup=InlineKeyboardMarkup(kb))
 
-@dp.callback_query(F.data == "verif_result_no")
-async def verif_result_no(cb: CallbackQuery, state: FSMContext):
-    await state.set_state(VerifFlow.send_result)
-    await cb.message.edit_text(
-        "Отправь скриншот результата матча заново:"
-    )
+def prime_give_cb(update, context):
+    q = update.callback_query; q.answer()
+    context.user_data["prime_action"] = "give"
+    q.edit_message_text("Введите UID для выдачи Prime:")
+    return WAIT_UID_PRIME
 
-@dp.callback_query(F.data == "verif_result_yes")
-async def verif_result_yes(cb: CallbackQuery, state: FSMContext):
-    await state.set_state(VerifFlow.send_socials)
-    await cb.message.edit_text(
-        "🔗 <b>Шаг 2 из 3 — Соцсети</b>\n\n"
-        "Отправь ссылки на свои аккаунты (через запятую или каждый с новой строки):\n\n"
-        "• TikTok\n• YouTube\n• Telegram\n• Лайк (если есть)\n\n"
-        "Можешь пропустить те, которых нет — но хотя бы одна нужна.",
-        parse_mode="HTML"
-    )
+def prime_remove_cb(update, context):
+    q = update.callback_query; q.answer()
+    context.user_data["prime_action"] = "remove"
+    q.edit_message_text("Введите UID для снятия Prime:")
+    return WAIT_UID_PRIME
 
-@dp.message(VerifFlow.send_socials)
-async def verif_socials(msg: Message, state: FSMContext):
-    await state.update_data(socials=msg.text.strip())
-    await state.set_state(VerifFlow.send_screenshot)
-    await msg.answer(
-        "📸 <b>Шаг 3 из 3 — Скриншот владения</b>\n\n"
-        "Отправь скриншот, что <b>эти аккаунты принадлежат тебе</b>.\n\n"
-        "Например: скриншот настроек профиля, страницы с твоим именем, или что-то что однозначно докажет что это твой аккаунт.",
-        parse_mode="HTML"
-    )
+def prime_uid_received(update, context):
+    if not is_admin(update.effective_user.id): return ConversationHandler.END
+    uid = update.message.text.strip()
+    value = context.user_data.get("prime_action") == "give"
+    db.collection("users").document(uid).set({"prime": value}, merge=True)
+    update.message.reply_text(f"💎 Prime {'выдан ✅' if value else 'снят ❌'} для {uid}")
+    return ConversationHandler.END
 
-@dp.message(VerifFlow.send_screenshot, F.photo | F.document)
-async def verif_screenshot(msg: Message, state: FSMContext):
-    if msg.photo:
-        file_id = msg.photo[-1].file_id
-    else:
-        file_id = msg.document.file_id
+def admin_elo_cb(update, context):
+    q = update.callback_query; q.answer()
+    if not is_admin(q.from_user.id): return
+    q.edit_message_text("📊 Введите UID игрока:")
+    return WAIT_UID_ELO
 
-    data     = await state.get_data()
-    uid      = msg.from_user.id
-    tg_user  = msg.from_user.username or str(uid)
-    nick     = data["nickname"]
-    socials  = data.get("socials", "—")
+def elo_uid_received(update, context):
+    if not is_admin(update.effective_user.id): return ConversationHandler.END
+    context.user_data["elo_uid"] = update.message.text.strip()
+    update.message.reply_text("Введите новое значение ELO:")
+    return WAIT_ELO_VALUE
 
-    # Сохраняем заявку
-    db = load_db()
-    db["verif_requests"][str(uid)] = {
-        "nickname":    nick,
-        "tg_user":     tg_user,
-        "socials":     socials,
-        "result_file": data.get("result_file"),
-        "proof_file":  file_id,
-        "status":      "pending",
-        "date":        datetime.now().isoformat()
-    }
-    save_db(db)
-    await state.clear()
+def elo_value_received(update, context):
+    if not is_admin(update.effective_user.id): return ConversationHandler.END
+    try: elo = int(update.message.text.strip())
+    except:
+        update.message.reply_text("❌ Введите число.")
+        return WAIT_ELO_VALUE
+    uid = context.user_data["elo_uid"]
+    db.collection("users").document(uid).set({"elo": elo}, merge=True)
+    update.message.reply_text(f"📊 ELO = {elo} для {uid}")
+    return ConversationHandler.END
 
-    await msg.answer(
-        "⏳ <b>Заявка на верификацию отправлена!</b>\n\n"
-        "Администратор проверит данные и ответит в ближайшее время.\n"
-        "Ожидай уведомления здесь.",
-        parse_mode="HTML",
-        reply_markup=kb_back()
-    )
+def admin_verify_cb(update, context):
+    q = update.callback_query; q.answer()
+    if not is_admin(q.from_user.id): return
+    q.edit_message_text("✅ Введите UID игрока:")
+    return WAIT_UID_VERIFY
 
-    # Уведомляем всех админов
-    for admin_id in ADMIN_IDS:
+def verify_uid_received(update, context):
+    if not is_admin(update.effective_user.id): return ConversationHandler.END
+    context.user_data["verify_uid"] = update.message.text.strip()
+    kb = [[InlineKeyboardButton("🔵 Синяя", callback_data="verify_blue"),
+           InlineKeyboardButton("🟡 Золотая", callback_data="verify_gold")],
+          [InlineKeyboardButton("❌ Снять", callback_data="verify_remove")]]
+    update.message.reply_text("Тип верификации:", reply_markup=InlineKeyboardMarkup(kb))
+    return WAIT_VERIFY_TYPE
+
+def verify_type_cb(update, context):
+    q = update.callback_query; q.answer()
+    uid = context.user_data.get("verify_uid")
+    vmap = {"verify_blue": "blue", "verify_gold": "gold", "verify_remove": None}
+    labels = {"verify_blue": "🔵 Синяя выдана", "verify_gold": "🟡 Золотая выдана", "verify_remove": "❌ Снята"}
+    db.collection("users").document(uid).set({"verification": vmap[q.data]}, merge=True)
+    q.edit_message_text(f"{labels[q.data]} для {uid}")
+    return ConversationHandler.END
+
+def admin_tickets_cb(update, context):
+    q = update.callback_query; q.answer()
+    if not is_admin(q.from_user.id): return
+    tickets = list(db.collection("support_tickets").where("status", "==", "open").stream())
+    if not tickets:
+        q.edit_message_text("💬 Открытых тикетов нет."); return
+    text = "💬 Открытые тикеты:\n\n"
+    kb = []
+    for t in tickets:
+        d = t.to_dict()
+        text += f"#{t.id[:6]} от {d.get('username','?')}: {d.get('message','')[:50]}\n"
+        kb.append([InlineKeyboardButton(f"Ответить #{t.id[:6]}", callback_data=f"reply_{t.id}")])
+    q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb))
+
+def reply_ticket_cb(update, context):
+    q = update.callback_query; q.answer()
+    context.user_data["reply_ticket_id"] = q.data.replace("reply_", "")
+    q.edit_message_text("Введите ответ:")
+    return WAIT_SUPPORT_REPLY
+
+def support_reply_received(update, context):
+    if not is_admin(update.effective_user.id): return ConversationHandler.END
+    tid = context.user_data["reply_ticket_id"]
+    t = db.collection("support_tickets").document(tid).get()
+    if t.exists:
+        uid = t.to_dict().get("telegram_id")
+        db.collection("support_tickets").document(tid).update({"status": "closed"})
+        if uid:
+            context.bot.send_message(chat_id=uid, text=f"💬 Ответ поддержки:\n{update.message.text}")
+    update.message.reply_text("✅ Ответ отправлен.")
+    return ConversationHandler.END
+
+def support_cb(update, context):
+    q = update.callback_query; q.answer()
+    q.edit_message_text("💬 Опишите проблему:")
+    return WAIT_SUPPORT_MSG
+
+def support_msg_received(update, context):
+    user = update.effective_user
+    db.collection("support_tickets").add({
+        "telegram_id": user.id,
+        "username": user.username or user.first_name,
+        "message": update.message.text,
+        "status": "open"
+    })
+    update.message.reply_text("✅ Тикет создан!")
+    if ADMIN_ID:
+        context.bot.send_message(chat_id=ADMIN_ID,
+            text=f"📩 Тикет от @{user.username or user.first_name}:\n{update.message.text}")
+    return ConversationHandler.END
+
+def start_verify_cb(update, context):
+    q = update.callback_query; q.answer()
+    q.edit_message_text("✅ Шаг 1: Введите ваш игровой ID:")
+    return WAIT_VERIFY_GAME_ID
+
+def verify_game_id_received(update, context):
+    context.user_data["verify_game_id"] = update.message.text.strip()
+    update.message.reply_text("Шаг 2: Ссылки на соц. сети (Telegram, TikTok, YouTube, Like):")
+    return WAIT_VERIFY_SOCIALS
+
+def verify_socials_received(update, context):
+    context.user_data["verify_socials"] = update.message.text.strip()
+    update.message.reply_text("Шаг 3: Отправьте фото что соц. сети ваши:")
+    return WAIT_VERIFY_PHOTO
+
+def verify_photo_received(update, context):
+    user = update.effective_user
+    game_id = context.user_data.get("verify_game_id")
+    socials = context.user_data.get("verify_socials")
+    db.collection("verification_requests").add({
+        "telegram_id": user.id,
+        "username": user.username or user.first_name,
+        "game_id": game_id, "socials": socials, "status": "pending"
+    })
+    update.message.reply_text("📨 Заявка отправлена! Ожидайте.")
+    if ADMIN_ID:
+        caption = (f"🔔 Верификация!\n👤 @{user.username or user.first_name} (ID: {user.id})\n"
+                   f"🎮 ID: {game_id}\n🔗 Соц. сети: {socials}\n\n"
+                   f"Одобрить: /verify_approve {user.id}\nОтклонить: /verify_reject {user.id}")
         try:
-            caption = (
-                f"✅ <b>ЗАЯВКА НА ВЕРИФИКАЦИЮ</b>\n\n"
-                f"👤 Ник: <code>{nick}</code>\n"
-                f"📱 Telegram: @{tg_user} (<code>{uid}</code>)\n"
-                f"🔗 Соцсети:\n{socials}\n"
-                f"🕐 {datetime.now().strftime('%d.%m.%Y %H:%M')}"
-            )
-            # Отправляем скриншот владения с описанием
-            await bot.send_photo(
-                admin_id,
-                photo=file_id,
-                caption=caption,
-                reply_markup=kb_admin_verif(uid),
-                parse_mode="HTML"
-            )
-            # Отдельно скриншот матча
-            result_file = data.get("result_file")
-            if result_file:
-                await bot.send_photo(
-                    admin_id,
-                    photo=result_file,
-                    caption=f"📊 Скриншот матча от @{tg_user}"
-                )
-        except Exception:
-            pass
+            if update.message.photo:
+                context.bot.send_photo(chat_id=ADMIN_ID, photo=update.message.photo[-1].file_id, caption=caption)
+            else:
+                context.bot.send_message(chat_id=ADMIN_ID, text=caption)
+        except: pass
+    return ConversationHandler.END
 
-@dp.message(VerifFlow.send_screenshot)
-async def verif_screenshot_wrong(msg: Message):
-    await msg.answer("📸 Отправь <b>фото или файл</b> скриншота.", parse_mode="HTML")
+def verify_approve(update, context):
+    if not is_admin(update.effective_user.id): return
+    try: target_id = int(context.args[0])
+    except: update.message.reply_text("Использование: /verify_approve <id>"); return
+    kb = [[InlineKeyboardButton("🔵 Синяя", callback_data=f"vapprove_blue_{target_id}"),
+           InlineKeyboardButton("🟡 Золотая", callback_data=f"vapprove_gold_{target_id}")]]
+    update.message.reply_text("Какую верификацию выдать?", reply_markup=InlineKeyboardMarkup(kb))
 
-# ── Админ верифицирует ──
-@dp.callback_query(F.data.startswith("adm_verif_yes_"))
-async def adm_verif_yes(cb: CallbackQuery):
-    if cb.from_user.id not in ADMIN_IDS:
-        return await cb.answer("❌ Нет доступа")
+def verify_approve_type_cb(update, context):
+    q = update.callback_query; q.answer()
+    parts = q.data.split("_")
+    vtype, target_id = parts[1], int(parts[2])
+    db.collection("users").document(str(target_id)).set({"verification": vtype}, merge=True)
+    context.bot.send_message(chat_id=target_id,
+        text=f"✅ Вы прошли верификацию! {'🔵 Синяя' if vtype == 'blue' else '🟡 Золотая'}")
+    q.edit_message_text(f"✅ Выдано {target_id}")
 
-    uid = int(cb.data.split("_")[-1])
-    db  = load_db()
-    req = db["verif_requests"].get(str(uid), {})
-    nick = req.get("nickname", "?")
+def verify_reject(update, context):
+    if not is_admin(update.effective_user.id): return
+    try: target_id = int(context.args[0])
+    except: update.message.reply_text("Использование: /verify_reject <id>"); return
+    context.bot.send_message(chat_id=target_id,
+        text="❌ Вы не прошли верификацию. Наберите актив и напишите снова.")
+    update.message.reply_text(f"❌ Отклонено для {target_id}")
 
-    db["verif_requests"][str(uid)]["status"] = "approved"
-    save_db(db)
+def buy_prime_cb(update, context):
+    q = update.callback_query; q.answer()
+    q.edit_message_text("💎 Напишите администратору для покупки Prime.")
 
-    await bot.send_message(
-        uid,
-        "🎉 <b>Верификация одобрена!</b>\n\n"
-        f"Аккаунт <code>{nick}</code> теперь верифицирован на Flamely ✅\n\n"
-        "Значок появится рядом с ником на сайте.",
-        parse_mode="HTML",
-        reply_markup=kb_back()
-    )
-    await cb.message.edit_caption(
-        cb.message.caption + "\n\n✅ <b>Верификация одобрена</b>",
-        parse_mode="HTML"
-    )
+def cancel(update, context):
+    update.message.reply_text("Отменено.")
+    return ConversationHandler.END
 
-@dp.callback_query(F.data.startswith("adm_verif_no_"))
-async def adm_verif_no(cb: CallbackQuery):
-    if cb.from_user.id not in ADMIN_IDS:
-        return await cb.answer("❌ Нет доступа")
+def main():
+    updater = Updater(BOT_TOKEN, use_context=True)
+    dp = updater.dispatcher
 
-    uid = int(cb.data.split("_")[-1])
-    db  = load_db()
-    db["verif_requests"][str(uid)]["status"] = "rejected"
-    save_db(db)
-
-    await bot.send_message(
-        uid,
-        "❌ <b>Верификация отклонена.</b>\n\n"
-        "Причина могла быть:\n"
-        "• Соцсети не принадлежат тебе\n"
-        "• Недостаточно подписчиков\n"
-        "• Некорректные скриншоты\n\n"
-        "Можешь подать заявку повторно с корректными данными.",
-        parse_mode="HTML",
-        reply_markup=kb_back()
-    )
-    await cb.message.edit_caption(
-        cb.message.caption + "\n\n❌ <b>Отклонено</b>",
-        parse_mode="HTML"
+    conv = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(prime_give_cb, pattern="^prime_give$"),
+            CallbackQueryHandler(prime_remove_cb, pattern="^prime_remove$"),
+            CallbackQueryHandler(admin_elo_cb, pattern="^admin_elo$"),
+            CallbackQueryHandler(admin_verify_cb, pattern="^admin_verify$"),
+            CallbackQueryHandler(reply_ticket_cb, pattern="^reply_"),
+            CallbackQueryHandler(support_cb, pattern="^support$"),
+            CallbackQueryHandler(start_verify_cb, pattern="^start_verify$"),
+        ],
+        states={
+            WAIT_UID_PRIME: [MessageHandler(Filters.text & ~Filters.command, prime_uid_received)],
+            WAIT_UID_ELO: [MessageHandler(Filters.text & ~Filters.command, elo_uid_received)],
+            WAIT_ELO_VALUE: [MessageHandler(Filters.text & ~Filters.command, elo_value_received)],
+            WAIT_UID_VERIFY: [MessageHandler(Filters.text & ~Filters.command, verify_uid_received)],
+            WAIT_VERIFY_TYPE: [CallbackQueryHandler(verify_type_cb, pattern="^verify_")],
+            WAIT_SUPPORT_MSG: [MessageHandler(Filters.text & ~Filters.command, support_msg_received)],
+            WAIT_SUPPORT_REPLY: [MessageHandler(Filters.text & ~Filters.command, support_reply_received)],
+            WAIT_VERIFY_GAME_ID: [MessageHandler(Filters.text & ~Filters.command, verify_game_id_received)],
+            WAIT_VERIFY_SOCIALS: [MessageHandler(Filters.text & ~Filters.command, verify_socials_received)],
+            WAIT_VERIFY_PHOTO: [MessageHandler(Filters.photo | Filters.text, verify_photo_received)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
     )
 
-# ══════════════════════════════════════════════
-#  АДМИН-КОМАНДЫ
-# ══════════════════════════════════════════════
-@dp.message(Command("admin"))
-async def cmd_admin(msg: Message):
-    if msg.from_user.id not in ADMIN_IDS:
-        return
-    db = load_db()
-    prime_total  = len(db.get("prime_requests", {}))
-    prime_paid   = sum(1 for v in db.get("prime_requests", {}).values() if v.get("status") == "paid")
-    verif_total  = len(db.get("verif_requests", {}))
-    verif_pend   = sum(1 for v in db.get("verif_requests", {}).values() if v.get("status") == "pending")
+    dp.add_handler(CommandHandler("start", start))
+    dp.add_handler(CommandHandler("verify_approve", verify_approve))
+    dp.add_handler(CommandHandler("verify_reject", verify_reject))
+    dp.add_handler(CallbackQueryHandler(admin_prime_cb, pattern="^admin_prime$"))
+    dp.add_handler(CallbackQueryHandler(admin_tickets_cb, pattern="^admin_tickets$"))
+    dp.add_handler(CallbackQueryHandler(verify_approve_type_cb, pattern="^vapprove_"))
+    dp.add_handler(CallbackQueryHandler(buy_prime_cb, pattern="^buy_prime$"))
+    dp.add_handler(conv)
 
-    await msg.answer(
-        "⚙️ <b>ADMIN PANEL — Ella Bot</b>\n\n"
-        f"💎 Prime заявок: <b>{prime_total}</b> (ожидают выдачи: <b>{prime_paid}</b>)\n"
-        f"✅ Верификаций: <b>{verif_total}</b> (на рассмотрении: <b>{verif_pend}</b>)\n\n"
-        "<b>Команды:</b>\n"
-        "/pending_prime — список ожидающих Prime\n"
-        "/pending_verif — список ожидающих верификации\n"
-        "/notify &lt;id&gt; &lt;текст&gt; — написать пользователю",
-        parse_mode="HTML"
-    )
-
-@dp.message(Command("pending_prime"))
-async def cmd_pending_prime(msg: Message):
-    if msg.from_user.id not in ADMIN_IDS:
-        return
-    db   = load_db()
-    reqs = {k: v for k, v in db.get("prime_requests", {}).items() if v.get("status") == "paid"}
-    if not reqs:
-        return await msg.answer("Нет ожидающих выдачи Prime.")
-    for uid, r in reqs.items():
-        await msg.answer(
-            f"💎 <b>Prime — ожидает выдачи</b>\n"
-            f"👤 Ник: <code>{r['nickname']}</code>\n"
-            f"📱 @{r.get('tg_user', uid)} (<code>{uid}</code>)\n"
-            f"🕐 {r.get('date','?')[:16]}",
-            reply_markup=kb_admin_prime(int(uid), r['nickname']),
-            parse_mode="HTML"
-        )
-
-@dp.message(Command("pending_verif"))
-async def cmd_pending_verif(msg: Message):
-    if msg.from_user.id not in ADMIN_IDS:
-        return
-    db   = load_db()
-    reqs = {k: v for k, v in db.get("verif_requests", {}).items() if v.get("status") == "pending"}
-    if not reqs:
-        return await msg.answer("Нет ожидающих верификации.")
-    for uid, r in reqs.items():
-        text = (
-            f"✅ <b>Верификация — ожидает</b>\n"
-            f"👤 Ник: <code>{r['nickname']}</code>\n"
-            f"📱 @{r.get('tg_user', uid)} (<code>{uid}</code>)\n"
-            f"🔗 Соцсети: {r.get('socials','—')}\n"
-            f"🕐 {r.get('date','?')[:16]}"
-        )
-        proof = r.get("proof_file")
-        if proof:
-            await bot.send_photo(msg.chat.id, photo=proof, caption=text,
-                                 reply_markup=kb_admin_verif(int(uid)), parse_mode="HTML")
-        else:
-            await msg.answer(text, reply_markup=kb_admin_verif(int(uid)), parse_mode="HTML")
-
-@dp.message(Command("notify"))
-async def cmd_notify(msg: Message):
-    if msg.from_user.id not in ADMIN_IDS:
-        return
-    parts = msg.text.split(maxsplit=2)
-    if len(parts) < 3:
-        return await msg.answer("Формат: /notify <user_id> <текст>")
-    try:
-        target_id = int(parts[1])
-        text      = parts[2]
-        await bot.send_message(target_id,
-            f"📢 <b>Сообщение от администрации Flamely:</b>\n\n{text}",
-            parse_mode="HTML", reply_markup=kb_back())
-        await msg.answer("✅ Отправлено")
-    except Exception as e:
-        await msg.answer(f"❌ Ошибка: {e}")
-
-# ══════════════════════════════════════════════
-#  ЗАПУСК
-# ══════════════════════════════════════════════
-async def main():
-    print("🤖 Ella Bot запущен...")
-    await dp.start_polling(bot)
+    print("Бот запущен!")
+    updater.start_polling()
+    updater.idle()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
